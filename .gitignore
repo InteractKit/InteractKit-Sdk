@@ -1,0 +1,25 @@
+# Binaries for programs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, should not be committed to git
+# (gocheck output, see https://golang.org)
+# vendor/
+# vendor/
+go.test
+
+# IDE specific files
+.idea/
+.vscode/
+.history/
+
+# Environment-specific or temporary files
+*.log
+*.tmp
+*.local
+
+# Go workspace file
+go.work.lock
