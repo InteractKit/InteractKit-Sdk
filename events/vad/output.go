@@ -1,21 +1,17 @@
 package vad
 
-import "interactkit/core"
-
-type VADUserSpeechChunkEvent struct {
-	AudioChunk core.AudioChunk
+type VADUserSpeakingEvent struct {
 }
 
-func (e *VADUserSpeechChunkEvent) GetId() string {
-	return "vad.user_speech.chunk"
+func (e *VADUserSpeakingEvent) GetId() string {
+	return "vad.user_speaking"
 }
 
-type VADSilenceChunkEvent struct {
-	AudioChunk core.AudioChunk
+type VADSilenceEvent struct {
 }
 
-func (e *VADSilenceChunkEvent) GetId() string {
-	return "vad.silence.chunk"
+func (e *VADSilenceEvent) GetId() string {
+	return "vad.silence"
 }
 
 type VadInterruptionDetectedEvent struct {
@@ -23,6 +19,18 @@ type VadInterruptionDetectedEvent struct {
 
 func (e *VadInterruptionDetectedEvent) GetId() string {
 	return "vad.interruption.detected"
+}
+
+type VadInterruptionSuspectedEvent struct{}
+
+func (e *VadInterruptionSuspectedEvent) GetId() string {
+	return "vad.interruption.suspected"
+}
+
+type VadInterruptionConfirmedEvent struct{}
+
+func (e *VadInterruptionConfirmedEvent) GetId() string {
+	return "vad.interruption.confirmed"
 }
 
 type VadUserSpeechEndedEvent struct {

@@ -23,3 +23,15 @@ go.test
 
 # Go workspace file
 go.work.lock
+
+
+# external dependencies
+external/
+
+# logs
+logs/
+
+# compiled interactkit binary
+interactkit
+
+# UI is a submodule (InteractKit/interactkit-ui)

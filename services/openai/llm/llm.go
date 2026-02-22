@@ -1,12 +1,13 @@
 package llm
 
 import (
-	"context"
+	stdctx "context"
+	"encoding/json"
 	"fmt"
 	"interactkit/core"
 	"sync"
+	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -14,16 +15,18 @@ import (
 type OpenAILLMService struct {
 	client      *openai.Client
 	apiKey      string
+	baseURL     string
 	model       string
 	maxTokens   int
 	temperature float32
 	streaming   bool
+	logger      *core.Logger
 
 	// Streaming management
 	activeStreams map[string]*openai.ChatCompletionStream
 	streamsMutex  sync.RWMutex
-	ctx           context.Context
-	cancel        context.CancelFunc
+	ctx           stdctx.Context
+	cancel        stdctx.CancelFunc
 
 	// Service state
 	isInitialized bool
@@ -32,27 +35,53 @@ type OpenAILLMService struct {
 
 // Config holds the configuration for OpenAI service
 type Config struct {
-	APIKey      string
-	Model       string
-	MaxTokens   int
-	Temperature float32
-	Streaming   bool
+	APIKey      string  `json:"api_key"`
+	BaseURL     string  `json:"base_url,omitempty"`
+	Model       string  `json:"model"`
+	MaxTokens   int     `json:"max_tokens"`
+	Temperature float32 `json:"temperature"`
+	Streaming   bool    `json:"streaming"`
+}
+
+// DefaultConfig returns a Config with sensible defaults
+func DefaultConfig() Config {
+	return Config{
+		Model:       "gpt-4o",
+		MaxTokens:   1024,
+		Temperature: 1.0,
+		Streaming:   true,
+	}
 }
 
 // NewOpenAILLMService creates a new instance of OpenAILLMService
-func NewOpenAILLMService(config Config) *OpenAILLMService {
+func NewOpenAILLMService(config Config, logger *core.Logger) *OpenAILLMService {
+	if logger == nil {
+		logger = core.GetLogger()
+	}
 	return &OpenAILLMService{
 		apiKey:        config.APIKey,
+		baseURL:       config.BaseURL,
 		model:         config.Model,
 		maxTokens:     config.MaxTokens,
 		temperature:   config.Temperature,
 		streaming:     config.Streaming,
+		logger:        logger,
 		activeStreams: make(map[string]*openai.ChatCompletionStream),
 	}
 }
 
+// newClient creates an OpenAI client, using a custom base URL if configured.
+func (s *OpenAILLMService) newClient() *openai.Client {
+	if s.baseURL != "" {
+		cfg := openai.DefaultConfig(s.apiKey)
+		cfg.BaseURL = s.baseURL
+		return openai.NewClientWithConfig(cfg)
+	}
+	return openai.NewClient(s.apiKey)
+}
+
 // Init initializes the OpenAI service
-func (s *OpenAILLMService) Init(ctx context.Context) error {
+func (s *OpenAILLMService) Initialize(ctx stdctx.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -61,15 +90,9 @@ func (s *OpenAILLMService) Init(ctx context.Context) error {
 	}
 
 	// Create context with cancel for managing streams
-	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.ctx, s.cancel = stdctx.WithCancel(stdctx.Background())
 
-	s.client = openai.NewClient(s.apiKey)
-
-	// Test the connection
-	_, err := s.client.ListModels(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to connect to OpenAI: %w", err)
-	}
+	s.client = s.newClient()
 
 	s.isInitialized = true
 	return nil
@@ -91,6 +114,7 @@ func (s *OpenAILLMService) Cleanup() error {
 
 	s.client = nil
 	s.isInitialized = false
+	s.logger.Info("OpenAI LLM service cleaned up")
 
 	return nil
 }
@@ -109,10 +133,10 @@ func (s *OpenAILLMService) Reset() error {
 	}
 
 	// Create new context
-	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.ctx, s.cancel = stdctx.WithCancel(stdctx.Background())
 
 	// Recreate client with same config
-	s.client = openai.NewClient(s.apiKey)
+	s.client = s.newClient()
 
 	// Clear active streams map
 	s.activeStreams = make(map[string]*openai.ChatCompletionStream)
@@ -200,11 +224,11 @@ func (s *OpenAILLMService) RunCompletion(
 
 	// Create chat completion request
 	req := openai.ChatCompletionRequest{
-		Model:       s.model,
-		Messages:    openAIMessages,
-		MaxTokens:   s.maxTokens,
-		Temperature: s.temperature,
-		Stream:      s.streaming,
+		Model:               s.model,
+		Messages:            openAIMessages,
+		MaxCompletionTokens: s.maxTokens,
+		Temperature:         s.temperature,
+		Stream:              s.streaming,
 	}
 
 	// Add tools if available
@@ -231,16 +255,27 @@ func (s *OpenAILLMService) runStreamingCompletion(
 	toolInvocationChan chan<- core.LLMToolCall,
 	FatalServiceErrorChan chan<- error,
 ) {
-	// Check if service was reset
+	// Capture the context once under a read lock. Reset() may replace s.ctx at
+	// any time; we must check the *same* context that was passed to the API call
+	// when deciding whether an error was caused by a VAD interruption.
+	s.mu.RLock()
+	ctx := s.ctx
+	s.mu.RUnlock()
+
+	// Check if service was reset before we even started
 	select {
-	case <-s.ctx.Done():
-		FatalServiceErrorChan <- fmt.Errorf("service was reset during streaming")
+	case <-ctx.Done():
 		return
 	default:
 	}
 
-	stream, err := s.client.CreateChatCompletionStream(s.ctx, req)
+	stream, err := s.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
+		// If the captured context was cancelled (e.g. Reset() called due to VAD
+		// interruption), this is expected — don't treat it as a fatal error.
+		if ctx.Err() != nil {
+			return
+		}
 		FatalServiceErrorChan <- fmt.Errorf("failed to create completion stream: %w", err)
 		return
 	}
@@ -257,7 +292,7 @@ func (s *OpenAILLMService) runStreamingCompletion(
 
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			// Service was reset, stop streaming immediately
 			return
 		default:
@@ -274,7 +309,7 @@ func (s *OpenAILLMService) runStreamingCompletion(
 			// Handle content streaming
 			if choice.Delta.Content != "" {
 				select {
-				case <-s.ctx.Done():
+				case <-ctx.Done():
 					return
 				case outChan <- choice.Delta.Content:
 				}
@@ -316,7 +351,7 @@ func (s *OpenAILLMService) runStreamingCompletion(
 				for _, toolCall := range toolCallBuilder {
 					if toolCall.Function.Name != "" {
 						select {
-						case <-s.ctx.Done():
+						case <-ctx.Done():
 							return
 						case toolInvocationChan <- s.convertToolCall(*toolCall):
 						}
@@ -336,16 +371,23 @@ func (s *OpenAILLMService) runNonStreamingCompletion(
 	toolInvocationChan chan<- core.LLMToolCall,
 	FatalServiceErrorChan chan<- error,
 ) {
-	// Check if service was reset
+	// Capture the context once under a read lock (same reasoning as runStreamingCompletion).
+	s.mu.RLock()
+	ctx := s.ctx
+	s.mu.RUnlock()
+
+	// Check if service was reset before we even started
 	select {
-	case <-s.ctx.Done():
-		FatalServiceErrorChan <- fmt.Errorf("service was reset during completion")
+	case <-ctx.Done():
 		return
 	default:
 	}
 
-	resp, err := s.client.CreateChatCompletion(s.ctx, req)
+	resp, err := s.client.CreateChatCompletion(ctx, req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		FatalServiceErrorChan <- fmt.Errorf("failed to create completion: %w", err)
 		return
 	}
@@ -356,7 +398,7 @@ func (s *OpenAILLMService) runNonStreamingCompletion(
 		// Send content
 		if choice.Message.Content != "" {
 			select {
-			case <-s.ctx.Done():
+			case <-ctx.Done():
 				return
 			case outChan <- choice.Message.Content:
 			}
@@ -366,13 +408,68 @@ func (s *OpenAILLMService) runNonStreamingCompletion(
 		if len(choice.Message.ToolCalls) > 0 {
 			for _, toolCall := range choice.Message.ToolCalls {
 				select {
-				case <-s.ctx.Done():
+				case <-ctx.Done():
 					return
 				case toolInvocationChan <- s.convertToolCall(toolCall):
 				}
 			}
 		}
 	}
+}
+
+// GenerateJsonOutput generates JSON output from the LLM context.
+// It uses its own timeout context so that service resets (which cancel s.ctx
+// to stop streaming) do not kill short-lived one-shot requests like filler generation.
+func (s *OpenAILLMService) GenerateJsonOutput(context core.LLMContext) (map[string]any, error) {
+	s.mu.RLock()
+	initialized := s.isInitialized
+	s.mu.RUnlock()
+	if !initialized {
+		return nil, fmt.Errorf("OpenAI service not initialized")
+	}
+
+	openAIMessages, err := s.convertMessages(context.Messages)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert messages: %w", err)
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:               s.model,
+		Messages:            openAIMessages,
+		MaxCompletionTokens: s.maxTokens,
+		Temperature:         s.temperature,
+		Stream:              false,
+		ResponseFormat: &openai.ChatCompletionResponseFormat{
+			Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+		},
+	}
+
+	if len(context.Tools) > 0 {
+		tools, err := s.convertTools(context.Tools)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert tools: %w", err)
+		}
+		req.Tools = tools
+	}
+
+	reqCtx, cancel := stdctx.WithTimeout(stdctx.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := s.client.CreateChatCompletion(reqCtx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create JSON completion: %w", err)
+	}
+
+	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+		return nil, fmt.Errorf("empty completion response")
+	}
+
+	var jsonOutput map[string]any
+	if err := json.Unmarshal([]byte(resp.Choices[0].Message.Content), &jsonOutput); err != nil {
+		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
+	}
+
+	return jsonOutput, nil
 }
 
 // convertMessages converts core messages to OpenAI messages
@@ -450,17 +547,13 @@ func (s *OpenAILLMService) convertTools(tools []core.LLMTool) ([]openai.Tool, er
 			parameters["required"] = required
 		}
 
-		paramsJSON, err := sonic.Marshal(parameters)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal parameters: %w", err)
-		}
-
+		// Pass parameters as a map, not as a JSON string
 		openAITools = append(openAITools, openai.Tool{
 			Type: openai.ToolTypeFunction,
 			Function: &openai.FunctionDefinition{
 				Name:        tool.ToolId,
 				Description: tool.Description,
-				Parameters:  paramsJSON,
+				Parameters:  parameters,
 			},
 		})
 	}
@@ -505,7 +598,7 @@ func (s *OpenAILLMService) convertToolCall(toolCall openai.ToolCall) core.LLMToo
 	var parameters map[string]interface{}
 
 	if toolCall.Function.Arguments != "" {
-		err := sonic.Unmarshal([]byte(toolCall.Function.Arguments), &parameters)
+		err := json.Unmarshal([]byte(toolCall.Function.Arguments), &parameters)
 		if err != nil {
 			// If unmarshaling fails, create a map with the raw arguments
 			parameters = map[string]interface{}{

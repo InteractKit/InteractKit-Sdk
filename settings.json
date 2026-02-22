@@ -1,0 +1,46 @@
+{
+  "transport": {
+    "livekit": {}
+  },
+  "session_config": {
+    "stt": {
+      "handler": {},
+      "service": {
+        "deepgram": {
+          "interim_results": true,
+          "punctuate": true,
+          "smart_format": true
+        }
+      }
+    },
+    "llm": {
+      "handler": {
+        "allow_tool_calls": true,
+        "pre_emptive_generation": true,
+        "generate_fillers": true
+      },
+      "service": {
+        "openai": {
+          "streaming": true,
+          "model": "gpt-4o"
+        }
+      }
+    },
+    "tts": {
+      "handler": {},
+      "service": {
+        "deepgram": {}
+      }
+    },
+    "context": {
+      "manager": {
+        "allow_continue_listening": true,
+        "human_like_speech": true
+      },
+      "handler": {
+        "add_keep_quiet_tool": true,
+        "keep_quiet_instructions": ""
+      }
+    }
+  }
+}

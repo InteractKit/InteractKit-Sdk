@@ -1,0 +1,48 @@
+# Dockerfile.ui — UI server image (no agent binary)
+# Usage: docker build -f Dockerfile.ui -t interactkit-ui .
+# Run:   docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -p 8888:8888 interactkit-ui
+#
+# Set SPAWNER_TYPE=docker and AGENT_DOCKER_IMAGE=interactkit-agent:latest
+# to enable Docker-based agent spawning.
+
+# ── Stage 1: Next.js static export ───────────────────────────────────────────
+FROM node:20-slim AS ui-builder
+
+WORKDIR /app/ui
+COPY ui/package.json ui/package-lock.json* ./
+RUN npm ci
+COPY ui/ .
+RUN npm run build
+
+# ── Stage 2: Go build ───────────────────────────────────────────────────────
+FROM golang:1.24-bookworm AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 go build -o /app/ui-server ./ui/server/
+
+# ── Stage 3: Runtime ────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# UI server binary
+COPY --from=builder /app/ui-server .
+
+# UI static files (Next.js static export)
+COPY --from=ui-builder /app/ui/out/ ./ui/public/
+
+ENV SPAWNER_TYPE=local
+
+EXPOSE 8888
+
+ENTRYPOINT ["./ui-server"]

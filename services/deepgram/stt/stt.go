@@ -2,20 +2,21 @@ package stt
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"interactkit/core"
+	"interactkit/utils/audio"
 	"net/url"
 	"sync"
 	"time"
 
-	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
 )
 
 // DeepgramSTTService implements the ISTTService interface for Deepgram's streaming STT
 type DeepgramSTTService struct {
-	apiKey  string
-	baseURL string
 	config  *DeepgramConfig
+	logger  *core.Logger
 
 	conn        *websocket.Conn
 	connMu      sync.RWMutex
@@ -25,99 +26,120 @@ type DeepgramSTTService struct {
 	interimOutputChan     chan<- string
 	fatalServiceErrorChan chan<- error
 
-	closeOnce   sync.Once
-	done        chan struct{}
+	done        <-chan struct{}
 	reconnectMu sync.Mutex
 }
 
 // DeepgramConfig holds configuration options for Deepgram STT
 type DeepgramConfig struct {
-	Model           string
-	Language        string
-	InterimResults  bool
-	Punctuate       bool
-	SmartFormat     bool
-	Diarize         bool
-	ProfanityFilter bool
-	Redact          string
-	Numerals        bool
-	Endpointing     any // Can be string, int, or bool
-	VadEvents       bool
-	UtteranceEndMs  any
-	Encoding        string
-	SampleRate      int
-	Channels        int
-	Multichannel    bool
-	Keywords        []string
-	Keyterms        []string
-	Search          []string
-	Replace         any
-	Callback        string
-	CallbackMethod  string
-	Extra           map[string]string
-	Tag             []string
-	DetectEntities  bool
-	Dictation       bool
-	MipOptOut       bool
-	Version         string
+	APIKey          string            `json:"api_key"`
+	BaseURL         string            `json:"base_url"`
+	Model           string            `json:"model"`
+	Language        string            `json:"language"`
+	InterimResults  bool              `json:"interim_results"`
+	Punctuate       bool              `json:"punctuate"`
+	SmartFormat     bool              `json:"smart_format"`
+	Diarize         bool              `json:"diarize"`
+	ProfanityFilter bool              `json:"profanity_filter"`
+	Redact          string            `json:"redact"`
+	Numerals        bool              `json:"numerals"`
+	Endpointing     any               `json:"endpointing"` // Can be string, int, or bool
+	VadEvents       bool              `json:"vad_events"`
+	UtteranceEndMs  any               `json:"utterance_end_ms"`
+	Multichannel    bool              `json:"multichannel"`
+	Keywords        []string          `json:"keywords"`
+	Keyterms        []string          `json:"keyterms"`
+	Search          []string          `json:"search"`
+	Replace         any               `json:"replace"`
+	Callback        string            `json:"callback"`
+	CallbackMethod  string            `json:"callback_method"`
+	Extra           map[string]string `json:"extra"`
+	Tag             []string          `json:"tag"`
+	DetectEntities  bool              `json:"detect_entities"`
+	Dictation       bool              `json:"dictation"`
+	MipOptOut       bool              `json:"mip_opt_out"`
+	Version         string            `json:"version"`
 }
 
-// DefaultConfig returns a default configuration for Deepgram
+// DefaultConfig returns a default configuration for Deepgram STT
 func DefaultConfig() *DeepgramConfig {
 	return &DeepgramConfig{
-		Model:          "nova-2-general",
+		BaseURL:        "wss://api.deepgram.com",
+		Model:          "nova-2",
 		InterimResults: true,
 		Punctuate:      true,
 		SmartFormat:    true,
-		Encoding:       "linear16",
-		SampleRate:     16000,
-		Endpointing:    10,
+		VadEvents:      false,
 	}
 }
 
-// NewDeepgramSTTService creates a new Deepgram STT service instance
-func NewDeepgramSTTService(apiKey string, config *DeepgramConfig) *DeepgramSTTService {
+// NewDeepgramSTTService creates a new Deepgram STT service instance.
+// Use DefaultConfig() to get a config with sensible defaults and override only what you need.
+func NewDeepgramSTTService(config *DeepgramConfig, logger *core.Logger) *DeepgramSTTService {
 	if config == nil {
 		config = DefaultConfig()
 	}
+	if config.BaseURL == "" {
+		config.BaseURL = "wss://api.deepgram.com"
+	}
+	if logger == nil {
+		logger = core.GetLogger()
+	}
 
 	return &DeepgramSTTService{
-		apiKey:  apiKey,
-		baseURL: "wss://api.deepgram.com",
-		config:  config,
-		done:    make(chan struct{}),
+		config: config,
+		logger: logger,
 	}
 }
 
 // Init initializes the Deepgram STT service
-func (d *DeepgramSTTService) Init(ctx context.Context) error {
+func (d *DeepgramSTTService) Initialize(ctx context.Context) error {
 	// Validate configuration
-	if d.apiKey == "" {
+	if d.config.APIKey == "" {
 		return fmt.Errorf("Deepgram API key is required")
 	}
+	d.done = ctx.Done()
 
 	return nil
 }
 
 // Cleanup cleans up resources used by the service
 func (d *DeepgramSTTService) Cleanup() error {
-	d.closeOnce.Do(func() {
-		close(d.done)
-		d.closeConnection()
-	})
+	// Safely close the WebSocket connection
+	d.closeConnection()
+	// Set output channels to nil to avoid sending on closed channels
+	d.outChan = nil
+	d.interimOutputChan = nil
+	d.fatalServiceErrorChan = nil
+	d.logger.Info("Deepgram STT service cleaned up")
 	return nil
 }
 
 // Reset resets the service to its initial state
 func (d *DeepgramSTTService) Reset() error {
-	// Close existing connection
-	d.closeConnection()
-
-	// Reset state
-	d.conn = nil
-	d.isConnected = false
-
+	flushMsg := ListenV1Finalize{Type: "Finalize"}
+	if msg, err := json.Marshal(flushMsg); err == nil {
+		d.connMu.Lock()
+		if d.isConnected && d.conn != nil {
+			_ = d.conn.WriteMessage(websocket.TextMessage, msg)
+		}
+		d.connMu.Unlock()
+	}
 	return nil
+}
+
+func (d *DeepgramSTTService) Flush() error {
+	flushMsg := ListenV1Finalize{Type: "Finalize"}
+	if msg, err := json.Marshal(flushMsg); err == nil {
+		d.connMu.Lock()
+		if d.isConnected && d.conn != nil {
+			_ = d.conn.WriteMessage(websocket.TextMessage, msg)
+		}
+		d.connMu.Unlock()
+		return nil
+	} else {
+		return fmt.Errorf("failed to marshal flush message: %w", err)
+	}
 }
 
 // StartTranscriptionSession starts a new transcription session with Deepgram
@@ -134,16 +156,19 @@ func (d *DeepgramSTTService) StartTranscriptionSession(
 }
 
 // SendTranscriptionAudio sends audio data to the active transcription session
-func (d *DeepgramSTTService) SendTranscriptionAudio(audioData []byte) error {
-	d.connMu.RLock()
-	defer d.connMu.RUnlock()
+func (d *DeepgramSTTService) SendTranscriptionAudio(chunk core.AudioChunk) error {
 
 	if !d.isConnected || d.conn == nil {
 		return fmt.Errorf("not connected to Deepgram")
 	}
-
+	converted, convertErr := audio.ConvertAudioChunk(chunk, core.PCM, 1, 16000)
+	if convertErr != nil {
+		return fmt.Errorf("failed to convert audio chunk: %w", convertErr)
+	}
 	// Send audio data as binary message
-	err := d.conn.WriteMessage(websocket.BinaryMessage, audioData)
+	d.connMu.Lock()
+	err := d.conn.WriteMessage(websocket.BinaryMessage, *converted.Data)
+	d.connMu.Unlock()
 	if err != nil {
 		// Attempt to reconnect on write error
 		go d.handleConnectionError(err)
@@ -161,12 +186,17 @@ func (d *DeepgramSTTService) runSession() {
 			return
 		default:
 			if err := d.connectAndListen(); err != nil {
+				// Only send error if channel is not nil and context is not done
 				select {
-				case d.fatalServiceErrorChan <- fmt.Errorf("Deepgram session error: %w", err):
 				case <-d.done:
 					return
 				default:
-					// Non-blocking send
+					if d.fatalServiceErrorChan != nil {
+						select {
+						case d.fatalServiceErrorChan <- fmt.Errorf("Deepgram session error: %w", err):
+						default:
+						}
+					}
 				}
 
 				// Wait before reconnecting
@@ -193,7 +223,7 @@ func (d *DeepgramSTTService) connectAndListen() error {
 
 	// Set up headers
 	headers := map[string][]string{
-		"Authorization": {"Token " + d.apiKey},
+		"Authorization": {"Token " + d.config.APIKey},
 	}
 
 	// Establish connection
@@ -235,7 +265,7 @@ func (d *DeepgramSTTService) connectAndListen() error {
 
 // buildWebSocketURL constructs the WebSocket URL with query parameters
 func (d *DeepgramSTTService) buildWebSocketURL() (string, error) {
-	base, err := url.Parse(d.baseURL + "/v1/listen")
+	base, err := url.Parse(d.config.BaseURL + "/v1/listen")
 	if err != nil {
 		return "", err
 	}
@@ -265,17 +295,9 @@ func (d *DeepgramSTTService) buildWebSocketURL() (string, error) {
 		q.Set("redact", d.config.Redact)
 	}
 
-	if d.config.Encoding != "" {
-		q.Set("encoding", d.config.Encoding)
-	}
-
-	if d.config.SampleRate > 0 {
-		q.Set("sample_rate", intToString(d.config.SampleRate))
-	}
-
-	if d.config.Channels > 0 {
-		q.Set("channels", intToString(d.config.Channels))
-	}
+	q.Set("encoding", "linear16")
+	q.Set("sample_rate", intToString(16000))
+	q.Set("channels", intToString(1))
 
 	if d.config.Endpointing != nil {
 		switch v := d.config.Endpointing.(type) {
@@ -337,39 +359,40 @@ func (d *DeepgramSTTService) buildWebSocketURL() (string, error) {
 
 // handleMessage processes incoming WebSocket messages
 func (d *DeepgramSTTService) handleMessage(message []byte) error {
+	d.logger.Debugf("Received message from Deepgram: %s", string(message))
 	var base struct {
-		Type string `sonic:"type"`
+		Type string `json:"type"`
 	}
 
-	if err := sonic.Unmarshal(message, &base); err != nil {
+	if err := json.Unmarshal(message, &base); err != nil {
 		return fmt.Errorf("failed to parse message type: %w", err)
 	}
 
 	switch base.Type {
 	case "Results":
 		var result ListenV1Results
-		if err := sonic.Unmarshal(message, &result); err != nil {
+		if err := json.Unmarshal(message, &result); err != nil {
 			return fmt.Errorf("failed to parse results: %w", err)
 		}
 		d.processResults(result)
 
 	case "Metadata":
 		var metadata ListenV1Metadata
-		if err := sonic.Unmarshal(message, &metadata); err != nil {
+		if err := json.Unmarshal(message, &metadata); err != nil {
 			return fmt.Errorf("failed to parse metadata: %w", err)
 		}
 		// Handle metadata if needed
 
 	case "UtteranceEnd":
 		var utteranceEnd ListenV1UtteranceEnd
-		if err := sonic.Unmarshal(message, &utteranceEnd); err != nil {
+		if err := json.Unmarshal(message, &utteranceEnd); err != nil {
 			return fmt.Errorf("failed to parse utterance end: %w", err)
 		}
 		// Handle utterance end if needed
 
 	case "SpeechStarted":
 		var speechStarted ListenV1SpeechStarted
-		if err := sonic.Unmarshal(message, &speechStarted); err != nil {
+		if err := json.Unmarshal(message, &speechStarted); err != nil {
 			return fmt.Errorf("failed to parse speech started: %w", err)
 		}
 		// Handle speech started if needed
@@ -388,20 +411,38 @@ func (d *DeepgramSTTService) processResults(result ListenV1Results) {
 	}
 
 	transcript := result.Channel.Alternatives[0].Transcript
+	if transcript == "" {
+		d.logger.Debug("Received empty transcript, ignoring")
+		return
+	}
 
-	if result.IsFinal {
+	if result.IsFinal || result.SpeechFinal || result.FromFinalize {
+		d.logger.Debugf("STT Final Result: %s", transcript)
 		select {
-		case d.outChan <- transcript:
 		case <-d.done:
+			// Don't send if context is done
+			return
 		default:
-			// Non-blocking send
+			if d.outChan != nil {
+				select {
+				case d.outChan <- transcript:
+				default:
+				}
+			}
 		}
 	} else {
+		d.logger.Debugf("STT Interim Result: %s", transcript)
 		select {
-		case d.interimOutputChan <- transcript:
 		case <-d.done:
+			// Don't send if context is done
+			return
 		default:
-			// Non-blocking send
+			if d.interimOutputChan != nil {
+				select {
+				case d.interimOutputChan <- transcript:
+				default:
+				}
+			}
 		}
 	}
 }
@@ -416,14 +457,14 @@ func (d *DeepgramSTTService) keepAlive() {
 		case <-d.done:
 			return
 		case <-ticker.C:
-			d.connMu.RLock()
+			d.connMu.Lock()
 			if d.isConnected && d.conn != nil {
 				keepAliveMsg := ListenV1KeepAlive{Type: "KeepAlive"}
-				if msg, err := sonic.Marshal(keepAliveMsg); err == nil {
+				if msg, err := json.Marshal(keepAliveMsg); err == nil {
 					_ = d.conn.WriteMessage(websocket.TextMessage, msg)
 				}
 			}
-			d.connMu.RUnlock()
+			d.connMu.Unlock()
 		}
 	}
 }
@@ -436,7 +477,7 @@ func (d *DeepgramSTTService) closeConnection() {
 	if d.conn != nil {
 		// Send close message
 		closeMsg := ListenV1CloseStream{Type: "CloseStream"}
-		if msg, err := sonic.Marshal(closeMsg); err == nil {
+		if msg, err := json.Marshal(closeMsg); err == nil {
 			_ = d.conn.WriteMessage(websocket.TextMessage, msg)
 		}
 
@@ -471,76 +512,76 @@ func intToString(i int) string {
 // Message structs based on the AsyncAPI specification
 
 type ListenV1Results struct {
-	Type         string  `sonic:"type"`
-	ChannelIndex []int   `sonic:"channel_index"`
-	Duration     float64 `sonic:"duration"`
-	Start        float64 `sonic:"start"`
-	IsFinal      bool    `sonic:"is_final"`
-	SpeechFinal  bool    `sonic:"speech_final"`
+	Type         string  `json:"type"`
+	ChannelIndex []int   `json:"channel_index"`
+	Duration     float64 `json:"duration"`
+	Start        float64 `json:"start"`
+	IsFinal      bool    `json:"is_final"`
+	SpeechFinal  bool    `json:"speech_final"`
 	Channel      struct {
 		Alternatives []struct {
-			Transcript string  `sonic:"transcript"`
-			Confidence float64 `sonic:"confidence"`
+			Transcript string  `json:"transcript"`
+			Confidence float64 `json:"confidence"`
 			Words      []struct {
-				Word           string  `sonic:"word"`
-				Start          float64 `sonic:"start"`
-				End            float64 `sonic:"end"`
-				Confidence     float64 `sonic:"confidence"`
-				Speaker        int     `sonic:"speaker,omitempty"`
-				PunctuatedWord string  `sonic:"punctuated_word,omitempty"`
-			} `sonic:"words"`
-		} `sonic:"alternatives"`
-	} `sonic:"channel"`
+				Word           string  `json:"word"`
+				Start          float64 `json:"start"`
+				End            float64 `json:"end"`
+				Confidence     float64 `json:"confidence"`
+				Speaker        int     `json:"speaker,omitempty"`
+				PunctuatedWord string  `json:"punctuated_word,omitempty"`
+			} `json:"words"`
+		} `json:"alternatives"`
+	} `json:"channel"`
 	Metadata struct {
-		RequestID string `sonic:"request_id"`
+		RequestID string `json:"request_id"`
 		ModelInfo struct {
-			Name    string `sonic:"name"`
-			Version string `sonic:"version"`
-			Arch    string `sonic:"arch"`
-		} `sonic:"model_info"`
-		ModelUUID string `sonic:"model_uuid"`
-	} `sonic:"metadata"`
-	FromFinalize bool `sonic:"from_finalize,omitempty"`
+			Name    string `json:"name"`
+			Version string `json:"version"`
+			Arch    string `json:"arch"`
+		} `json:"model_info"`
+		ModelUUID string `json:"model_uuid"`
+	} `json:"metadata"`
+	FromFinalize bool `json:"from_finalize,omitempty"`
 	Entities     []struct {
-		Label      string  `sonic:"label"`
-		Value      string  `sonic:"value"`
-		RawValue   string  `sonic:"raw_value"`
-		Confidence float64 `sonic:"confidence"`
-		StartWord  int     `sonic:"start_word"`
-		EndWord    int     `sonic:"end_word"`
-	} `sonic:"entities,omitempty"`
+		Label      string  `json:"label"`
+		Value      string  `json:"value"`
+		RawValue   string  `json:"raw_value"`
+		Confidence float64 `json:"confidence"`
+		StartWord  int     `json:"start_word"`
+		EndWord    int     `json:"end_word"`
+	} `json:"entities,omitempty"`
 }
 
 type ListenV1Metadata struct {
-	Type           string  `sonic:"type"`
-	TransactionKey string  `sonic:"transaction_key"`
-	RequestID      string  `sonic:"request_id"`
-	Sha256         string  `sonic:"sha256"`
-	Created        string  `sonic:"created"`
-	Duration       float64 `sonic:"duration"`
-	Channels       int     `sonic:"channels"`
+	Type           string  `json:"type"`
+	TransactionKey string  `json:"transaction_key"`
+	RequestID      string  `json:"request_id"`
+	Sha256         string  `json:"sha256"`
+	Created        string  `json:"created"`
+	Duration       float64 `json:"duration"`
+	Channels       int     `json:"channels"`
 }
 
 type ListenV1UtteranceEnd struct {
-	Type        string  `sonic:"type"`
-	Channel     []int   `sonic:"channel"`
-	LastWordEnd float64 `sonic:"last_word_end"`
+	Type        string  `json:"type"`
+	Channel     []int   `json:"channel"`
+	LastWordEnd float64 `json:"last_word_end"`
 }
 
 type ListenV1SpeechStarted struct {
-	Type      string  `sonic:"type"`
-	Channel   []int   `sonic:"channel"`
-	Timestamp float64 `sonic:"timestamp"`
+	Type      string  `json:"type"`
+	Channel   []int   `json:"channel"`
+	Timestamp float64 `json:"timestamp"`
 }
 
 type ListenV1KeepAlive struct {
-	Type string `sonic:"type"`
+	Type string `json:"type"`
 }
 
 type ListenV1CloseStream struct {
-	Type string `sonic:"type"`
+	Type string `json:"type"`
 }
 
 type ListenV1Finalize struct {
-	Type string `sonic:"type"`
+	Type string `json:"type"`
 }

@@ -2,16 +2,18 @@ package transport
 
 import "interactkit/core"
 
-type SerializerService interface {
-	Deserialize(core.RawData) (core.AudioChunk, core.VideoChunk, string, error)
-	SerializeAudioOutput(audioChunk core.AudioChunk) (core.RawData, error)
-	SerializeVideoOutput(videoChunk core.VideoChunk) (core.RawData, error)
-	SerializeTextOutput(text string) (core.RawData, error)
+// TransportConfig holds configuration for the transport handler
+type TransportConfig struct {
+	OutSampleRate  int                      `json:"out_sample_rate"`  // Sample rate for outgoing audio
+	OutChannels    int                      `json:"out_channels"`     // Number of channels for outgoing audio
+	OutAudioFormat core.AudioEncodingFormat `json:"out_audio_format"` // Encoding format for outgoing audio
 }
 
-type TransportConfig struct {
-	serializer     SerializerService
-	OutSampleRate  int
-	OutChannels    int
-	OutAudioFormat core.AudioEncodingFormat
+// DefaultConfig returns a TransportConfig with sensible defaults
+func DefaultConfig() TransportConfig {
+	return TransportConfig{
+		OutSampleRate:  24000,
+		OutChannels:    1,
+		OutAudioFormat: core.PCM,
+	}
 }

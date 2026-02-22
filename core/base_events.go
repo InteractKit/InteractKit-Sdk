@@ -15,3 +15,13 @@ type WarningEvent struct {
 func (e *WarningEvent) GetId() string {
 	return "shared.warning"
 }
+
+// EndCallEvent is fired when the agent decides to terminate the session.
+// The runner handles it by stopping the pipeline gracefully.
+type EndCallEvent struct {
+	Reason string
+}
+
+func (e *EndCallEvent) GetId() string {
+	return "shared.end_call"
+}

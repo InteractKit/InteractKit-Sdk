@@ -4,39 +4,46 @@ import (
 	"context"
 	"interactkit/core"
 	"interactkit/events/transport"
-	"interactkit/utils/audio"
 )
 
-type TransportService interface {
+type ITransportService interface {
 	core.IService
 	Connect() error
-	SendRawOutput(data core.RawData) error
-	StartReceiving(outputChan chan<- core.RawData, errorChan chan<- error)
+	SendEvent(data core.IEvent) error
+	StartReceiving(outputChan chan<- core.MediaChunk, errorChan chan<- error)
 }
 
 // TransportHandlerWrapper holds shared state
 type TransportHandlerWrapper struct {
-	service        TransportService
-	backupServices []TransportService
-	ctx            context.Context
+	service        ITransportService
+	backupServices []ITransportService
 	config         TransportConfig
+	logger         *core.Logger
 
 	// Shared state
 	connected bool
 }
 
+// NewTransportHandlerWrapper creates a new transport handler wrapper.
+// Use DefaultConfig() to get a config with sensible defaults and override only what you need.
+// Chain WithBackupService to register fallback services.
 func NewTransportHandlerWrapper(
-	service TransportService,
-	backupServices []TransportService,
-	ctx context.Context,
+	service ITransportService,
 	config TransportConfig,
+	logger *core.Logger,
 ) *TransportHandlerWrapper {
 	return &TransportHandlerWrapper{
-		service:        service,
-		backupServices: backupServices,
-		ctx:            ctx,
-		config:         config,
+		service: service,
+		config:  config,
+		logger:  logger,
 	}
+}
+
+// WithBackupService registers a fallback service used when the primary fails.
+// Returns the wrapper to allow chaining.
+func (w *TransportHandlerWrapper) WithBackupService(service ITransportService) *TransportHandlerWrapper {
+	w.backupServices = append(w.backupServices, service)
+	return w
 }
 
 func (w *TransportHandlerWrapper) GetInputHandler() *TransportInputHandler {
@@ -47,7 +54,7 @@ func (w *TransportHandlerWrapper) GetInputHandler() *TransportInputHandler {
 
 	return &TransportInputHandler{
 		BaseHandler: *core.NewBaseHandler(
-			w.service, typedServices, w.ctx,
+			w.service, typedServices, nil, w.logger,
 		),
 		config:  w.config,
 		wrapper: w,
@@ -62,7 +69,7 @@ func (w *TransportHandlerWrapper) GetOutputHandler() *TransportOutputHandler {
 
 	return &TransportOutputHandler{
 		BaseHandler: *core.NewBaseHandler(
-			w.service, typedServices, w.ctx,
+			w.service, typedServices, nil, w.logger,
 		),
 		config:  w.config,
 		wrapper: w,
@@ -76,20 +83,23 @@ type TransportInputHandler struct {
 	wrapper *TransportHandlerWrapper
 }
 
-func (h *TransportInputHandler) Init(
+func (h *TransportInputHandler) Initialize(
 	inputChan <-chan *core.EventPacket,
 	outputNextChan chan<- *core.EventPacket,
 	outputTopChan chan<- *core.EventPacket,
 	ctx context.Context,
 ) error {
+	h.Logger.Info("Initializing TransportInputHandler with service")
 	err := h.BaseHandler.Initialize(inputChan, outputNextChan, outputTopChan, ctx)
 	if err != nil {
 		return err
 	}
+	h.BaseHandler.SetHandleEventFunc(h.HandleEvent)
 
 	if !h.wrapper.connected {
-		err = h.Service.(TransportService).Connect()
+		err = h.Service.(ITransportService).Connect()
 		if err != nil {
+			h.Logger.With(map[string]interface{}{"error": err}).Error("Failed to connect transport service")
 			return err
 		}
 		h.wrapper.connected = true
@@ -98,46 +108,48 @@ func (h *TransportInputHandler) Init(
 }
 
 func (h *TransportInputHandler) Start() error {
-	outputChan := make(chan core.RawData)
-	errorChan := make(chan error)
+	outputChan := make(chan core.MediaChunk, 100)
+	errorChan := make(chan error, 10)
 
-	go h.Service.(TransportService).StartReceiving(outputChan, errorChan)
+	go h.Service.(ITransportService).StartReceiving(outputChan, errorChan)
 
 	for {
 		select {
 		case outputData := <-outputChan:
-			audioChunk, videoChunk, text, err := h.config.serializer.Deserialize(outputData)
-			if err != nil {
-				h.HandlerErrorChan <- err
-				continue
-			}
-
-			if audioChunk.Data != nil {
-				audioEvent := &transport.TransportAudioInputEvent{
-					AudioChunk: audioChunk,
-				}
-				h.SendPacket(core.NewEventPacket(audioEvent, core.EventRelayDestinationNextService, "TransportInputHandler"))
-			}
-
-			if videoChunk.Data != nil {
-				videoEvent := &transport.TransportVideoInputEvent{
-					VideoChunk: videoChunk,
-				}
-				h.SendPacket(core.NewEventPacket(videoEvent, core.EventRelayDestinationNextService, "TransportInputHandler"))
-			}
-
-			if text != "" {
-				textEvent := &transport.TransportTextInputEvent{
-					Text: text,
-				}
-				h.SendPacket(core.NewEventPacket(textEvent, core.EventRelayDestinationNextService, "TransportInputHandler"))
-			}
+			// Process audio synchronously to avoid goroutine accumulation
+			// The VAD has a mutex that would cause goroutine pileup if spawned async
+			processAudio(outputData, h)
 
 		case err := <-errorChan:
 			h.FatalServiceErrorChan <- err
 		case <-h.Ctx.Done():
 			return nil
 		}
+	}
+}
+
+func processAudio(outputData core.MediaChunk, h *TransportInputHandler) {
+	audioChunk, videoChunk, textChunk := outputData.Audio, outputData.Video, outputData.Text
+	if audioChunk.Data != nil {
+
+		audioEvent := &transport.TransportAudioInputEvent{
+			AudioChunk: audioChunk,
+		}
+		h.SendPacket(core.NewEventPacket(audioEvent, core.EventRelayDestinationNextService, "TransportInputHandler"))
+	}
+
+	if videoChunk.Data != nil {
+		videoEvent := &transport.TransportVideoInputEvent{
+			VideoChunk: videoChunk,
+		}
+		h.SendPacket(core.NewEventPacket(videoEvent, core.EventRelayDestinationNextService, "TransportInputHandler"))
+	}
+
+	if textChunk.Text != "" {
+		textEvent := &transport.TransportTextInputEvent{
+			Text: textChunk.Text,
+		}
+		h.SendPacket(core.NewEventPacket(textEvent, core.EventRelayDestinationNextService, "TransportInputHandler"))
 	}
 }
 
@@ -153,7 +165,7 @@ type TransportOutputHandler struct {
 	wrapper *TransportHandlerWrapper
 }
 
-func (h *TransportOutputHandler) Init(
+func (h *TransportOutputHandler) Initialize(
 	inputChan <-chan *core.EventPacket,
 	outputNextChan chan<- *core.EventPacket,
 	outputTopChan chan<- *core.EventPacket,
@@ -163,9 +175,10 @@ func (h *TransportOutputHandler) Init(
 	if err != nil {
 		return err
 	}
+	h.BaseHandler.SetHandleEventFunc(h.HandleEvent)
 
 	if !h.wrapper.connected {
-		err = h.Service.(TransportService).Connect()
+		err = h.Service.(ITransportService).Connect()
 		if err != nil {
 			return err
 		}
@@ -180,52 +193,21 @@ func (h *TransportOutputHandler) Start() error {
 }
 
 func (h *TransportOutputHandler) HandleEvent(eventPacket *core.EventPacket) error {
-	switch event := eventPacket.Event.(type) {
-	case *transport.TransportAudioOutputEvent:
-		processedAudioChunk, err := audio.ConvertAudioChunk(
-			event.AudioChunk, h.config.OutAudioFormat, h.config.OutChannels, h.config.OutSampleRate,
-		)
-		if err != nil {
-			h.HandlerErrorChan <- err
-			return err
-		}
-		event.AudioChunk = processedAudioChunk
-		rawData, err := h.config.serializer.SerializeAudioOutput(event.AudioChunk)
-		if err != nil {
-			h.HandlerErrorChan <- err
-			return err
-		}
-		err = h.Service.(TransportService).SendRawOutput(rawData)
-		if err != nil {
-			h.FatalServiceErrorChan <- err
-			return err
-		}
-
-	case *transport.TransportVideoOutputEvent:
-		rawData, err := h.config.serializer.SerializeVideoOutput(event.VideoChunk)
-		if err != nil {
-			h.FatalServiceErrorChan <- err
-			return err
-		}
-		err = h.Service.(TransportService).SendRawOutput(rawData)
-		if err != nil {
-			h.FatalServiceErrorChan <- err
-			return err
-		}
-
-	case *transport.TransportTextOutputEvent:
-		rawData, err := h.config.serializer.SerializeTextOutput(event.Text)
-		if err != nil {
-			h.FatalServiceErrorChan <- err
-			return err
-		}
-		err = h.Service.(TransportService).SendRawOutput(rawData)
-		if err != nil {
-			h.FatalServiceErrorChan <- err
-			return err
-		}
+	err := h.Service.(ITransportService).SendEvent(eventPacket.Event)
+	if err != nil {
+		h.Logger.With(map[string]interface{}{"error": err}).Error("Failed to send event through transport service")
+		return err
 	}
 
 	h.SendPacket(eventPacket)
+	return nil
+}
+
+func (h *TransportOutputHandler) Cleanup() error {
+	if h.wrapper.connected {
+		h.Logger.Info("Cleaning up TransportOutputHandler and disconnecting service")
+		h.wrapper.connected = false
+	}
+	h.Logger.Info("TransportOutputHandler cleaned up")
 	return nil
 }

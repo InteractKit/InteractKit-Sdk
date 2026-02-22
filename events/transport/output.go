@@ -25,27 +25,3 @@ type TransportTextInputEvent struct {
 func (e *TransportTextInputEvent) GetId() string {
 	return "serializer.text_input"
 }
-
-type TransportAudioOutputEvent struct {
-	AudioChunk core.AudioChunk
-}
-
-func (e *TransportAudioOutputEvent) GetId() string {
-	return "serializer.audio_output"
-}
-
-type TransportVideoOutputEvent struct {
-	VideoChunk core.VideoChunk
-}
-
-func (e *TransportVideoOutputEvent) GetId() string {
-	return "serializer.video_output"
-}
-
-type TransportTextOutputEvent struct {
-	Text string
-}
-
-func (e *TransportTextOutputEvent) GetId() string {
-	return "serializer.text_output"
-}

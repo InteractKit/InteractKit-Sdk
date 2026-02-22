@@ -57,11 +57,12 @@ type LLMTool struct {
 	ToolId      string      `json:"tool_id"`              // Id of the tool.
 	Description string      `json:"description"`          // Description of the tool's functionality.
 	Parameters  []Parameter `json:"parameters,omitempty"` // Parameters required by the tool.
+	ServerURL   string      `json:"server_url,omitempty"` // URL for external tool execution. When set, tool calls are forwarded as HTTP POST requests to this URL instead of being handled locally.
 }
 
 type LLMContext struct {
-	Messages []LLMMessage
-	Tools    []LLMTool
+	Messages []LLMMessage `json:"messages"`        // Conversation history with the LLM.
+	Tools    []LLMTool    `json:"tools,omitempty"` // Optional list of tools available to the LLM.
 }
 
 func (c *LLMContext) AddUserMessage(text string) {

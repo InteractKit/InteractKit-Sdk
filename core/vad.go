@@ -1,6 +1,6 @@
 package core
 
 type VADResult struct {
-	IsSpeech   bool
-	Confidence float64
+	Confidence float32
+	Ready      bool // True when enough audio has been buffered to produce a valid result
 }
